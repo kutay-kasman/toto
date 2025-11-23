@@ -44,19 +44,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource
 def get_db_connection():
-    """Get direct SQLite database connection (cached)."""
+    """
+    Get direct SQLite database connection (thread-safe).
+    Creates a new connection each time to avoid threading issues in Streamlit Cloud.
+    """
     db_path = Path("data/matches.db")
     if not db_path.exists():
         # Try alternative path
         db_path = Path("matches.db")
     
     if not db_path.exists():
-        st.error(f"Database not found at {db_path}. Please ensure data/matches.db exists.")
         return None
     
-    return sqlite3.connect(str(db_path))
+    # Use check_same_thread=False for Streamlit Cloud compatibility
+    # This allows the connection to be used across different threads
+    return sqlite3.connect(str(db_path), check_same_thread=False)
 
 
 @st.cache_data
@@ -370,6 +373,7 @@ def show_model_stats():
     
     conn = get_db_connection()
     if conn is None:
+        st.error("Database not found. Please ensure data/matches.db exists.")
         return
     
     try:
