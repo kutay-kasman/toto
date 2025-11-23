@@ -65,111 +65,126 @@ def get_db_connection():
 @st.cache_data
 def get_historical_matches():
     """Get historical matches from database."""
-    conn = get_db_connection()
-    if conn is None:
+    db_path = Path("data/matches.db")
+    if not db_path.exists():
+        db_path = Path("matches.db")
+    
+    if not db_path.exists():
         return pd.DataFrame()
     
+    # Create connection inside the cached function to avoid threading issues
+    # Use context manager to ensure proper cleanup
     try:
-        df = pd.read_sql_query("""
-            SELECT home_team as 'Ev Sahibi Takım',
-                   away_team as 'Deplasman Takımı',
-                   result as 'Mac Sonucu',
-                   home_goals as 'Home_Goals',
-                   away_goals as 'Away_Goals'
-            FROM historical_matches
-            ORDER BY match_date, id
-        """, conn)
-        return df
+        with sqlite3.connect(str(db_path), check_same_thread=False) as conn:
+            df = pd.read_sql_query("""
+                SELECT home_team as 'Ev Sahibi Takım',
+                       away_team as 'Deplasman Takımı',
+                       result as 'Mac Sonucu',
+                       home_goals as 'Home_Goals',
+                       away_goals as 'Away_Goals'
+                FROM historical_matches
+                ORDER BY match_date, id
+            """, conn)
+            # Return a copy to ensure no connection references remain
+            return df.copy()
     except Exception as e:
-        st.error(f"Error loading historical matches: {e}")
         return pd.DataFrame()
-    finally:
-        conn.close()
 
 
 @st.cache_data
 def get_upcoming_matches():
     """Get upcoming matches from database."""
-    conn = get_db_connection()
-    if conn is None:
+    db_path = Path("data/matches.db")
+    if not db_path.exists():
+        db_path = Path("matches.db")
+    
+    if not db_path.exists():
         return pd.DataFrame()
     
+    # Create connection inside the cached function to avoid threading issues
+    # Use context manager to ensure proper cleanup
     try:
-        df = pd.read_sql_query("""
-            SELECT home_team as 'Ev Sahibi Takım',
-                   away_team as 'Deplasman Takımı',
-                   match_date
-            FROM upcoming_matches
-            ORDER BY match_date, id
-        """, conn)
-        return df
+        with sqlite3.connect(str(db_path), check_same_thread=False) as conn:
+            df = pd.read_sql_query("""
+                SELECT home_team as 'Ev Sahibi Takım',
+                       away_team as 'Deplasman Takımı',
+                       match_date
+                FROM upcoming_matches
+                ORDER BY match_date, id
+            """, conn)
+            # Return a copy to ensure no connection references remain
+            return df.copy()
     except Exception as e:
-        st.error(f"Error loading upcoming matches: {e}")
         return pd.DataFrame()
-    finally:
-        conn.close()
 
 
 @st.cache_data
 def get_predictions(limit=1000):
     """Get predictions from database."""
-    conn = get_db_connection()
-    if conn is None:
+    db_path = Path("data/matches.db")
+    if not db_path.exists():
+        db_path = Path("matches.db")
+    
+    if not db_path.exists():
         return pd.DataFrame()
     
+    # Create connection inside the cached function to avoid threading issues
+    # Use context manager to ensure proper cleanup
     try:
-        df = pd.read_sql_query("""
-            SELECT home_team, away_team, predicted_result,
-                   probability_1, probability_x, probability_2,
-                   actual_result, is_correct, prediction_date
-            FROM predictions
-            ORDER BY prediction_date DESC
-            LIMIT ?
-        """, conn, params=(limit,))
-        return df
+        with sqlite3.connect(str(db_path), check_same_thread=False) as conn:
+            df = pd.read_sql_query("""
+                SELECT home_team, away_team, predicted_result,
+                       probability_1, probability_x, probability_2,
+                       actual_result, is_correct, prediction_date
+                FROM predictions
+                ORDER BY prediction_date DESC
+                LIMIT ?
+            """, conn, params=(limit,))
+            # Return a copy to ensure no connection references remain
+            return df.copy()
     except Exception as e:
-        st.error(f"Error loading predictions: {e}")
         return pd.DataFrame()
-    finally:
-        conn.close()
 
 
 @st.cache_data
 def get_prediction_accuracy():
     """Calculate overall prediction accuracy."""
-    conn = get_db_connection()
-    if conn is None:
+    db_path = Path("data/matches.db")
+    if not db_path.exists():
+        db_path = Path("matches.db")
+    
+    if not db_path.exists():
         return {'total': 0, 'correct': 0, 'accuracy': 0.0}
     
+    # Create connection inside the cached function to avoid threading issues
+    # Use context manager to ensure proper cleanup
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 
-                COUNT(*) as total,
-                SUM(is_correct) as correct,
-                AVG(is_correct) as accuracy
-            FROM predictions
-            WHERE actual_result IS NOT NULL
-        """)
-        
-        result = cursor.fetchone()
-        if result and result[0] > 0:
-            return {
-                'total': result[0],
-                'correct': result[1] or 0,
-                'accuracy': (result[2] or 0) * 100
-            }
-        return {'total': 0, 'correct': 0, 'accuracy': 0.0}
+        with sqlite3.connect(str(db_path), check_same_thread=False) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(is_correct) as correct,
+                    AVG(is_correct) as accuracy
+                FROM predictions
+                WHERE actual_result IS NOT NULL
+            """)
+            
+            result = cursor.fetchone()
+            if result and result[0] > 0:
+                return {
+                    'total': result[0],
+                    'correct': result[1] or 0,
+                    'accuracy': (result[2] or 0) * 100
+                }
+            return {'total': 0, 'correct': 0, 'accuracy': 0.0}
     except Exception as e:
-        st.error(f"Error calculating accuracy: {e}")
         return {'total': 0, 'correct': 0, 'accuracy': 0.0}
-    finally:
-        conn.close()
 
 
 def main():
     """Main dashboard function."""
-    st.markdown('<h1 class="main-header">⚽ Football Match Prediction Dashboard</h1>', 
+    st.markdown('<h1 class="main-header">⚽ Football Match Prediction Dashboard by Kutay</h1>', 
                 unsafe_allow_html=True)
     
     # Check if database exists
@@ -240,7 +255,7 @@ def show_predictions():
             df_results = pd.DataFrame(results)
             
             # Display predictions table
-            st.dataframe(df_results, use_container_width=True, hide_index=True)
+            st.dataframe(df_results, width='stretch', hide_index=True)
             
             # Coupon format
             st.subheader("🎫 Coupon Format")
@@ -256,7 +271,7 @@ def show_predictions():
                 title="Distribution of Prediction Confidence",
                 labels={'Confidence': 'Confidence (%)', 'count': 'Number of Matches'}
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             
             # Probability visualization
             st.subheader("🎲 Probability Heatmap")
@@ -278,7 +293,7 @@ def show_predictions():
                 aspect="auto",
                 color_continuous_scale="RdYlGn"
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.warning("No predictions found for upcoming matches.")
     else:
@@ -331,7 +346,7 @@ def show_accuracy():
     )
     fig.add_hline(y=33.33, line_dash="dash", line_color="red", 
                   annotation_text="Random Guess (33.33%)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Confusion matrix
     st.subheader("🔍 Confusion Matrix")
@@ -354,7 +369,7 @@ def show_accuracy():
         labels=dict(x="Predicted", y="Actual", color="Count"),
         color_continuous_scale="Blues"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Recent predictions table
     st.subheader("📋 Recent Predictions")
@@ -362,7 +377,7 @@ def show_accuracy():
                    'actual_result', 'is_correct', 'prediction_date']
     st.dataframe(
         completed[display_cols].head(20),
-        use_container_width=True,
+        width='stretch',
         hide_index=True
     )
 
@@ -371,56 +386,60 @@ def show_model_stats():
     """Display model statistics and features."""
     st.header("🤖 Model Statistics")
     
-    conn = get_db_connection()
-    if conn is None:
+    db_path = Path("data/matches.db")
+    if not db_path.exists():
+        db_path = Path("matches.db")
+    
+    if not db_path.exists():
         st.error("Database not found. Please ensure data/matches.db exists.")
         return
     
+    # Create connection directly (not cached, so no threading issues)
+    # Use context manager to ensure proper cleanup
     try:
-        # Get model performance history from database
-        perf_df = pd.read_sql_query("""
-            SELECT model_name, accuracy, precision, recall, f1_score, training_date
-            FROM model_performance
-            ORDER BY training_date DESC
-            LIMIT 10
-        """, conn)
-        
-        if not perf_df.empty:
-            st.subheader("Model Information")
-            latest = perf_df.iloc[0]
-            st.info(f"**Model Type:** {latest['model_name']}\n\n"
-                   f"**Latest Accuracy:** {latest['accuracy']*100:.2f}%\n\n"
-                   f"**Latest Training:** {latest['training_date']}")
+        with sqlite3.connect(str(db_path), check_same_thread=False) as conn:
+            # Get model performance history from database
+            perf_df = pd.read_sql_query("""
+                SELECT model_name, accuracy, precision, recall, f1_score, training_date
+                FROM model_performance
+                ORDER BY training_date DESC
+                LIMIT 10
+            """, conn)
             
-            # Performance over time
-            st.subheader("📊 Model Performance Over Time")
-            perf_df['training_date'] = pd.to_datetime(perf_df['training_date'])
-            fig = px.line(
-                perf_df,
-                x='training_date',
-                y='accuracy',
-                title="Model Accuracy Over Time",
-                labels={'accuracy': 'Accuracy', 'training_date': 'Training Date'}
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Latest metrics
-            st.subheader("📈 Latest Model Metrics")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Accuracy", f"{latest['accuracy']*100:.2f}%")
-            with col2:
-                st.metric("Precision", f"{latest['precision']*100:.2f}%")
-            with col3:
-                st.metric("Recall", f"{latest['recall']*100:.2f}%")
-            with col4:
-                st.metric("F1 Score", f"{latest['f1_score']*100:.2f}%")
-        else:
-            st.info("No model performance data available. Model metrics are logged during training.")
+            if not perf_df.empty:
+                st.subheader("Model Information")
+                latest = perf_df.iloc[0]
+                st.info(f"**Model Type:** {latest['model_name']}\n\n"
+                       f"**Latest Accuracy:** {latest['accuracy']*100:.2f}%\n\n"
+                       f"**Latest Training:** {latest['training_date']}")
+                
+                # Performance over time
+                st.subheader("📊 Model Performance Over Time")
+                perf_df['training_date'] = pd.to_datetime(perf_df['training_date'])
+                fig = px.line(
+                    perf_df,
+                    x='training_date',
+                    y='accuracy',
+                    title="Model Accuracy Over Time",
+                    labels={'accuracy': 'Accuracy', 'training_date': 'Training Date'}
+                )
+                st.plotly_chart(fig, width='stretch')
+                
+                # Latest metrics
+                st.subheader("📈 Latest Model Metrics")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Accuracy", f"{latest['accuracy']*100:.2f}%")
+                with col2:
+                    st.metric("Precision", f"{latest['precision']*100:.2f}%")
+                with col3:
+                    st.metric("Recall", f"{latest['recall']*100:.2f}%")
+                with col4:
+                    st.metric("F1 Score", f"{latest['f1_score']*100:.2f}%")
+            else:
+                st.info("No model performance data available. Model metrics are logged during training.")
     except Exception as e:
         st.warning(f"Could not load model statistics: {e}")
-    finally:
-        conn.close()
 
 
 def show_data_overview():
@@ -454,7 +473,7 @@ def show_data_overview():
         names=result_counts.index,
         title="Distribution of Match Results"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Team statistics
     st.subheader("🏆 Team Statistics")
@@ -468,11 +487,11 @@ def show_data_overview():
         title="Top 10 Most Frequent Home Teams",
         labels={'x': 'Number of Matches', 'y': 'Team'}
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Data preview
     st.subheader("👀 Data Preview")
-    st.dataframe(historical.head(20), use_container_width=True, hide_index=True)
+    st.dataframe(historical.head(20), width='stretch', hide_index=True)
 
 
 if __name__ == "__main__":
