@@ -77,7 +77,9 @@ def get_historical_matches():
     try:
         with sqlite3.connect(str(db_path), check_same_thread=False) as conn:
             df = pd.read_sql_query("""
-                SELECT home_team as 'Ev Sahibi Takım',
+                SELECT id,
+                       match_date,
+                       home_team as 'Ev Sahibi Takım',
                        away_team as 'Deplasman Takımı',
                        result as 'Mac Sonucu',
                        home_goals as 'Home_Goals',
@@ -198,10 +200,9 @@ def main():
         return
     
     # Sidebar
-    st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Select Page",
-        ["This Week's Predictions", "Historical Accuracy", "Model Statistics", "Data Overview"]
+        ["This Week's Predictions", "Historical Accuracy", "Deep Analysis", "Model Statistics", "Data Overview"]
     )
     
     if page == "This Week's Predictions":
@@ -212,6 +213,186 @@ def main():
         show_model_stats()
     elif page == "Data Overview":
         show_data_overview()
+    elif page == "Deep Analysis":
+        show_deep_analysis()
+
+
+def show_deep_analysis():
+    """Display deep statistics and analysis."""
+    st.header("🔬 Deep Analysis")
+    
+    # Get all data
+    historical = get_historical_matches()
+    
+    if historical.empty:
+        st.warning("No historical data available.")
+        return
+        
+    # Tabs for different analysis modes
+    tab1, tab2 = st.tabs(["🏆 Team Analysis", "⚔️ Head-to-Head"])
+    
+    # --- Tab 1: Team Analysis ---
+    with tab1:
+        st.subheader("Team Performance Analysis")
+        
+        # Team Selector
+        all_teams = sorted(list(set(historical['Ev Sahibi Takım'].tolist() + 
+                                  historical['Deplasman Takımı'].tolist())))
+        selected_team = st.selectbox("Select Team", all_teams)
+        
+        if selected_team:
+            # Filter matches involving this team
+            team_matches = historical[
+                (historical['Ev Sahibi Takım'] == selected_team) | 
+                (historical['Deplasman Takımı'] == selected_team)
+            ].sort_values('id')  # Assuming 'id' correlates with time
+            
+            # --- Key Stats ---
+            total_games = len(team_matches)
+            wins = 0
+            draws = 0
+            losses = 0
+            goals_scored = 0
+            goals_conceded = 0
+            
+            for _, match in team_matches.iterrows():
+                is_home = match['Ev Sahibi Takım'] == selected_team
+                result = match['Mac Sonucu']
+                
+                # W/D/L
+                if result == 'X':
+                    draws += 1
+                elif (is_home and result == '1') or (not is_home and result == '2'):
+                    wins += 1
+                else:
+                    losses += 1
+                    
+                # Goals (handling potential None values)
+                h_goals = match.get('Home_Goals')
+                a_goals = match.get('Away_Goals')
+                
+                if pd.notna(h_goals) and pd.notna(a_goals):
+                    if is_home:
+                        goals_scored += int(h_goals)
+                        goals_conceded += int(a_goals)
+                    else:
+                        goals_scored += int(a_goals)
+                        goals_conceded += int(h_goals)
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Games", total_games)
+            with col2:
+                win_rate = (wins/total_games*100) if total_games > 0 else 0
+                st.metric("Win Rate", f"{win_rate:.1f}%")
+            with col3:
+                avg_scored = (goals_scored/total_games) if total_games > 0 else 0
+                st.metric("Avg Goals Scored", f"{avg_scored:.1f}")
+            with col4:
+                avg_conceded = (goals_conceded/total_games) if total_games > 0 else 0
+                st.metric("Avg Goals Conceded", f"{avg_conceded:.1f}")
+            
+            # --- Visuals ---
+            
+            # 1. Result Distribution Pie Chart
+            fig_pie = px.pie(
+                values=[wins, draws, losses],
+                names=['Win', 'Draw', 'Loss'],
+                title=f"{selected_team} Match Outcomes",
+                color_discrete_map={'Win': '#2ca02c', 'Draw': '#ff7f0e', 'Loss': '#d62728'}
+            )
+            st.plotly_chart(fig_pie, width='stretch')
+            
+            # 2. Form Guide (Last 10 Matches)
+            st.subheader("Recent Form (Last 10 Matches)")
+            last_10 = team_matches.tail(10).copy()
+            
+            form_data = []
+            for _, match in last_10.iterrows():
+                is_home = match['Ev Sahibi Takım'] == selected_team
+                opponent = match['Deplasman Takımı'] if is_home else match['Ev Sahibi Takım']
+                result = match['Mac Sonucu']
+                
+                outcome = 'Draw'
+                color = 'gray'
+                if (is_home and result == '1') or (not is_home and result == '2'):
+                    outcome = 'Win'
+                    color = 'green'
+                elif (is_home and result == '2') or (not is_home and result == '1'):
+                    outcome = 'Loss'
+                    color = 'red'
+                
+                score = "N/A"
+                if pd.notna(match.get('Home_Goals')):
+                    score = f"{int(match['Home_Goals'])}-{int(match['Away_Goals'])}"
+                
+                form_data.append({
+                    'Opponent': opponent,
+                    'Result': outcome,
+                    'Score': score,
+                    'Venue': 'Home' if is_home else 'Away',
+                    'Color': color
+                })
+            
+            form_df = pd.DataFrame(form_data)
+            st.table(form_df)
+
+    # --- Tab 2: Head-to-Head ---
+    with tab2:
+        st.subheader("Head-to-Head Comparison")
+        
+        col_a, col_b = st.columns(2)
+        with col_a:
+            team_a = st.selectbox("Team A", all_teams, index=0)
+        with col_b:
+            team_b = st.selectbox("Team B", all_teams, index=1 if len(all_teams) > 1 else 0)
+            
+        if team_a != team_b:
+            # Find H2H matches
+            h2h_matches = historical[
+                ((historical['Ev Sahibi Takım'] == team_a) & (historical['Deplasman Takımı'] == team_b)) |
+                ((historical['Ev Sahibi Takım'] == team_b) & (historical['Deplasman Takımı'] == team_a))
+            ]
+            
+            if h2h_matches.empty:
+                st.info("No historical matches found between these teams.")
+            else:
+                st.write(f"Found {len(h2h_matches)} matches.")
+                
+                # Calculate stats
+                a_wins = 0
+                b_wins = 0
+                draws = 0
+                
+                for _, match in h2h_matches.iterrows():
+                    res = match['Mac Sonucu']
+                    if res == 'X':
+                        draws += 1
+                    elif match['Ev Sahibi Takım'] == team_a:
+                        if res == '1': a_wins += 1
+                        else: b_wins += 1
+                    else: # match['Ev Sahibi Takım'] == team_b
+                        if res == '1': b_wins += 1
+                        else: a_wins += 1
+                
+                # Display Bars
+                st.write(f"**{team_a} Wins**: {a_wins} | **Draws**: {draws} | **{team_b} Wins**: {b_wins}")
+                
+                fig_h2h = go.Figure(data=[
+                    go.Bar(name=team_a, x=['Wins'], y=[a_wins], marker_color='#1f77b4'),
+                    go.Bar(name='Draw', x=['Wins'], y=[draws], marker_color='#7f7f7f'),
+                    go.Bar(name=team_b, x=['Wins'], y=[b_wins], marker_color='#ff7f0e')
+                ])
+                fig_h2h.update_layout(barmode='stack', title="Head-to-Head Results")
+                st.plotly_chart(fig_h2h, width='stretch')
+                
+                # Match History Table
+                st.subheader("Match History")
+                display_cols = ['Ev Sahibi Takım', 'Deplasman Takımı', 'Mac Sonucu', 'Home_Goals', 'Away_Goals']
+                st.dataframe(h2h_matches[display_cols].sort_index(ascending=False), hide_index=True)
+                
+        else:
+            st.warning("Please select distinct teams.")
 
 
 def show_predictions():
@@ -425,6 +606,23 @@ def show_model_stats():
                 )
                 st.plotly_chart(fig, width='stretch')
                 
+                st.plotly_chart(fig, width='stretch')
+                
+                # --- Optimized Hyperparameters ---
+                try:
+                    import joblib
+                    model_path = Path("models/xgboost_model.pkl")
+                    if model_path.exists():
+                        model_data = joblib.load(model_path)
+                        best_params = model_data.get('best_params', None)
+                        if best_params:
+                            st.subheader("⚙️ Optimized Hyperparameters")
+                            st.json(best_params)
+                        else:
+                            st.info("Model was trained without optimization or params not saved.")
+                except Exception as e:
+                    st.warning(f"Could not load hyperparameters: {e}")
+
                 # Latest metrics
                 st.subheader("📈 Latest Model Metrics")
                 col1, col2, col3, col4 = st.columns(4)

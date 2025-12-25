@@ -1,0 +1,98 @@
+# Betting Prediction System Explanation
+
+This document explains how your current system works, from data collection to prediction, and suggests ways to improve and visualize it.
+
+## 1. How It Works
+
+### The Pipeline ([main.py](file:///c:/Users/kutay/OneDrive/Desktop/toto/main.py))
+The system follows a standard "ETL" (Extract, Transform, Load) + Machine Learning pipeline:
+1.  **Scrape**: Collects match data from the web.
+2.  **Process**: Cleans the data and calculates statistics.
+3.  **Train**: Teaches the model using historical data.
+4.  **Predict**: Uses the trained model to guess the outcome of future matches.
+
+### Data Processing ([src/data_processing.py](file:///c:/Users/kutay/OneDrive/Desktop/toto/src/data_processing.py))
+This is where raw data is converted into "features" that the model can understand.
+
+#### **Which Data? (Key Features)**
+The model uses three main types of information to make a decision:
+
+1.  **Team Identity (Who is playing?)**:
+    *   It uses **One-Hot Encoding** for teams. This means every team has its own column (e.g., `Ev_Galatasaray`: 1 if True, 0 if False). This helps the model learn team-specific strengths (like "Galatasaray usually wins at home").
+
+2.  **Performance Ratios (Form)**:
+    *   Calculated based on the last **10 games** (configurable via `lookback_games`).
+    *   **Features:**
+        *   `Home_Win_Ratio`, `Home_Draw_Ratio`, `Home_Loss_Ratio`
+        *   `Away_Win_Ratio`, `Away_Draw_Ratio`, `Away_Loss_Ratio`
+    *   *Example:* If a team won 5 out of their last 10 games, their Win Ratio is 0.5.
+
+3.  **Goal Statistics (Offense/Defense)**:
+    *   Also based on the last **10 games**.
+    *   **Features:**
+        *   `Home_Avg_Goals_Scored` vs `Home_Avg_Goals_Conceded`
+        *   `Away_Avg_Goals_Scored` vs `Away_Avg_Goals_Conceded`
+
+#### **Data Cleaning**
+*   It removes matches with missing names or invalid results.
+*   It filters only for '1' (Home Win), 'X' (Draw), or '2' (Away Win).
+
+### The Model ([src/ml_model.py](file:///c:/Users/kutay/OneDrive/Desktop/toto/src/ml_model.py))
+
+#### **What Kind of Model?**
+You are using **XGBoost (Extreme Gradient Boosting)**.
+*   **Type:** `XGBClassifier`
+*   **Why XGBoost?** It is one of the most powerful algorithms for tabular data (tables with rows/columns). It builds a "forest" of decision trees, where each new tree tries to correct the mistakes of the previous ones.
+
+#### **Model Configuration**
+*   **Objective:** `multi:softmax` (Multiclass classification: 1, X, 2).
+*   **Handling Imbalance:** It calculates `sample_weights` to balance the classes. If "Draws" are rare, the model pays more attention to them so it doesn't just ignore them.
+*   **Cross-Validation:** It uses 5-fold cross-validation (`StratifiedKFold`). It splits your data into 5 parts, training on 4 and testing on 1, five times. This ensures the accuracy score is reliable and not just luck.
+
+---
+
+## 2. How to Improve It
+
+Here are steps to make your model "smarter":
+
+### A. Feature Engineering (Better Data)
+The current model only knows "who" and "recent form". It lacks context using these features:
+1.  **Head-to-Head (H2H):** How have these two specific teams performed against *each other* historically?
+2.  **League Position/Points:** A team might have good recent form but be in a lower league tier or position.
+3.  **Home vs Away Form Split:** Currently, it looks at *all* last 10 games. You should calculate "Home Form" (only games played at home) and "Away Form" separately. Teams often play differently at home.
+4.  **Strength of Schedule:** Winning against a top team is worth more than winning against a bottom team. (ELO ratings can help here).
+5.  **Rest Days:** How many days since their last match? Fatigue matters.
+
+### B. Model Tuning
+1.  **Hyperparameter Optimization:** The code currently uses fixed numbers (e.g., `max_depth=6`). You can use tools like `GridSearchCV` or `Optuna` to find the perfect settings automatically.
+2.  **Date-Based Splitting:** Currently, it splits data randomly (`train_test_split`). For sports, you should split by **time** (e.g., Train on 2020-2023, Test on 2024). This prevents "looking into the future".
+
+---
+
+## 3. How to Visualize It
+
+Understanding what the model sees is crucial.
+
+### A. Feature Importance Plot
+XGBoost has this built-in. It tells you **which factors matter most**.
+*   *Is "Home Win Ratio" more important than "Team Name"?*
+*   **Code:** `xgb.plot_importance(model)`
+
+### B. Confusion Matrix
+Shows where the model makes mistakes.
+*   *Does it predict '1' when it's actually 'X'?*
+*   It creates a 3x3 grid showing True vs Predicted labels.
+
+### C. Probability Distributions
+Visualize how confident the model is.
+*   Plot a histogram of `Probability_1`. Does it only verify wins when probability is >70%?
+
+### D. Learning Curves
+Plot "Accuracy vs Number of Training Examples".
+*   If the line is still going up, you simply need **more data** (more historical seasons).
+*   If the line is flat, you need **better features** (Data Processing).
+
+## Next Steps Plan
+1.  **Visualize:** Create a script to generate the Feature Importance and Confusion Matrix plots.
+2.  **Analyze:** Detailed review of the plots to see weaknesses (e.g., "It never predicts Draws correctly").
+3.  **Enhance:** Add "Head-to-Head" to [data_processing.py](file:///c:/Users/kutay/OneDrive/Desktop/toto/src/data_processing.py).

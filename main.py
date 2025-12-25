@@ -100,7 +100,7 @@ class PredictionPipeline:
             logger.error(f"Error in data processing: {e}", exc_info=True)
             return False
     
-    def train_model(self, retrain: bool = True):
+    def train_model(self, retrain: bool = True, optimize: bool = False, n_trials: int = 20):
         """
         Train the ML model.
         
@@ -126,7 +126,9 @@ class PredictionPipeline:
             # Train model
             metrics = self.model.train(
                 X_train, y_train, X_test, y_test,
-                use_cross_validation=True
+                use_cross_validation=True,
+                optimize=optimize,
+                n_trials=n_trials
             )
             
             # Save model
@@ -205,6 +207,133 @@ class PredictionPipeline:
             logger.error(f"Error in prediction pipeline: {e}", exc_info=True)
             return False
     
+    def update_prediction_accuracy(self, scrape_latest: bool = True):
+        """
+        Update predictions with actual results from historical matches.
+        Matches predictions with historical matches and updates accuracy.
+        
+        Args:
+            scrape_latest: If True, scrape only the latest week's results first.
+                          If False, use existing database data only.
+        """
+        logger.info("Starting prediction accuracy update")
+        
+        try:
+            # Optionally scrape latest week's results first
+            if scrape_latest:
+                logger.info("Scraping latest week's results...")
+                latest_matches = self.scraper.scrape_latest_week_results()
+                
+                if latest_matches:
+                    # Store latest week's results in database
+                    self.db.insert_historical_matches_batch(latest_matches)
+                    logger.info(f"Stored {len(latest_matches)} matches from latest week")
+                else:
+                    logger.warning("No matches found in latest week")
+            
+            # Get all predictions without actual results
+            predictions = self.db.get_predictions(limit=10000)
+            predictions_without_results = predictions[predictions['actual_result'].isna()]
+            
+            if predictions_without_results.empty:
+                logger.info("No predictions need updating")
+                return True
+            
+            logger.info(f"Found {len(predictions_without_results)} predictions without results")
+            
+            # Debug: Print all predictions that need updating
+            print("\n" + "="*60)
+            print("           PREDICTIONS WAITING FOR RESULTS")
+            print("="*60)
+            for idx, (_, pred) in enumerate(predictions_without_results.iterrows(), 1):
+                print(f"{idx:02}. {pred['home_team']:<30} vs {pred['away_team']:<30} (Predicted: {pred['predicted_result']})")
+            print("="*60 + "\n")
+            
+            # Get historical matches with results (prioritize latest week if scraped)
+            historical_df = self.db.get_historical_matches()
+            historical_with_results = historical_df[
+                historical_df['Mac Sonucu'].isin(['1', 'X', '2'])
+            ]
+            
+            if historical_with_results.empty:
+                logger.warning("No historical matches with results found")
+                return False
+            
+            # Debug: Print all scraped matches with results
+            print("\n" + "="*60)
+            print("           SCRAPED MATCHES WITH RESULTS")
+            print("="*60)
+            # Show only the most recent matches (last 20)
+            recent_matches = historical_with_results.tail(20)
+            for idx, (_, match) in enumerate(recent_matches.iterrows(), 1):
+                result = match['Mac Sonucu']
+                home_goals = match.get('Home_Goals', 'N/A')
+                away_goals = match.get('Away_Goals', 'N/A')
+                print(f"{idx:02}. {match['Ev Sahibi Takım']:<30} vs {match['Deplasman Takımı']:<30} "
+                      f"Result: {result} ({home_goals}-{away_goals})")
+            print(f"\nTotal matches with results in database: {len(historical_with_results)}")
+            print("="*60 + "\n")
+            
+            # Match predictions with historical matches
+            updated_count = 0
+            for _, pred in predictions_without_results.iterrows():
+                home_team = pred['home_team']
+                away_team = pred['away_team']
+                
+                # Find matching historical match
+                # Try exact match first
+                match = historical_with_results[
+                    (historical_with_results['Ev Sahibi Takım'] == home_team) &
+                    (historical_with_results['Deplasman Takımı'] == away_team)
+                ]
+                
+                if match.empty:
+                    # Try reverse match (teams might be swapped)
+                    match = historical_with_results[
+                        (historical_with_results['Ev Sahibi Takım'] == away_team) &
+                        (historical_with_results['Deplasman Takımı'] == home_team)
+                    ]
+                    # If found reverse match, need to reverse the result
+                    if not match.empty:
+                        actual_result = match.iloc[0]['Mac Sonucu']
+                        # Reverse: 1->2, 2->1, X->X
+                        if actual_result == '1':
+                            actual_result = '2'
+                        elif actual_result == '2':
+                            actual_result = '1'
+                        # X stays X
+                        logger.info(f"Found reverse match: {home_team} vs {away_team} -> {actual_result}")
+                    else:
+                        logger.debug(f"No match found for: {home_team} vs {away_team}")
+                        continue
+                else:
+                    actual_result = match.iloc[0]['Mac Sonucu']
+                    logger.info(f"Found exact match: {home_team} vs {away_team} -> {actual_result}")
+                
+                # Update prediction with actual result
+                self.db.update_prediction_result(home_team, away_team, actual_result)
+                updated_count += 1
+                logger.info(f"✓ Updated prediction: {home_team} vs {away_team} -> {actual_result}")
+            
+            logger.info(f"Updated {updated_count} predictions with actual results")
+            
+            # Print accuracy summary
+            accuracy = self.db.get_prediction_accuracy()
+            if accuracy['total'] > 0:
+                print("\n" + "="*60)
+                print("           PREDICTION ACCURACY SUMMARY")
+                print("="*60)
+                print(f"Total Predictions: {accuracy['total']}")
+                print(f"Correct Predictions: {accuracy['correct']}")
+                print(f"Accuracy: {accuracy['accuracy']:.2f}%")
+                print("="*60 + "\n")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating prediction accuracy: {e}", exc_info=True)
+            return False
+    
     def _print_predictions(self, predictions_df: pd.DataFrame):
         """Print predictions in formatted output."""
         print("\n" + "="*60)
@@ -231,10 +360,11 @@ def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['scrape', 'train', 'predict', 'full'],
+        choices=['scrape', 'train', 'predict', 'update-accuracy', 'full'],
         default='full',
         help='Pipeline mode: scrape (data only), train (model only), '
-             'predict (predictions only), full (all steps)'
+             'predict (predictions only), update-accuracy (update predictions with results), '
+             'full (all steps)'
     )
     parser.add_argument(
         '--force-refresh',
@@ -251,6 +381,17 @@ def main():
         '--retrain',
         action='store_true',
         help='Force retraining of model'
+    )
+    parser.add_argument(
+        '--optimize',
+        action='store_true',
+        help='Run hyperparameter optimization using Optuna'
+    )
+    parser.add_argument(
+        '--n-trials',
+        type=int,
+        default=20,
+        help='Number of trials for hyperparameter optimization'
     )
     
     args = parser.parse_args()
@@ -273,7 +414,11 @@ def main():
             return 1
     
     if args.mode in ['train', 'full']:
-        success = pipeline.train_model(retrain=args.retrain)
+        success = pipeline.train_model(
+            retrain=args.retrain,
+            optimize=args.optimize,
+            n_trials=args.n_trials
+        )
         if not success:
             logger.error("Training failed")
             return 1
@@ -283,6 +428,14 @@ def main():
         # predict_upcoming_matches returns DataFrame on success, False on failure
         if result is False or (isinstance(result, pd.DataFrame) and len(result) == 0):
             logger.error("Prediction failed")
+            return 1
+    
+    if args.mode == 'update-accuracy':
+        # Scrape latest week's results and update accuracy
+        # scrape_latest=True means it will scrape only the latest week (efficient)
+        success = pipeline.update_prediction_accuracy(scrape_latest=True)
+        if not success:
+            logger.error("Accuracy update failed")
             return 1
     
     logger.info("Pipeline completed successfully")
