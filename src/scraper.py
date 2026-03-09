@@ -9,10 +9,15 @@ import logging
 from src.database import MatchDatabase
 from src.scraper_utils import (
     cleanup_driver,
+    fetch_match_elements_with_retries,
+    parse_score_from_status_text,
     scrape_historical,
     scrape_latest_week,
     scrape_upcoming,
+    scroll_to_load_matches,
     setup_driver,
+    wait_for_min_matches,
+    wait_for_week_selector,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,12 +74,6 @@ class NesineScraper:
         """
         Scrape only the most recent week's match results.
         Wrapper around `scrape_latest_week`; handles DB write.
-        
-        Args:
-            url: URL to scrape from (can include pNo parameter, e.g., ?pNo=316)
-            
-        Returns:
-            List of (home_team, away_team, result, week_range, match_date, home_goals, away_goals) tuples
         """
         try:
             self.driver = setup_driver()
@@ -93,6 +92,93 @@ class NesineScraper:
         finally:
             cleanup_driver(self.driver)
             self.driver = None
+
+    def scrape_recent_weeks(self,
+                            n_weeks: int = 3,
+                            url: str = "https://www.nesine.com/sportoto/mac-sonuclari") -> List[Tuple]:
+        """
+        Scrape the N most recent weeks of results using a single browser session.
+        Returns combined list of all tuples across all scraped weeks.
+        """
+        import time as _time
+        from selenium.webdriver.support import expected_conditions as _EC
+        from selenium.webdriver.common.by import By as _By
+        from selenium.webdriver.support.ui import WebDriverWait as _WDW
+
+        all_results: List[Tuple] = []
+
+        try:
+            self.driver = setup_driver()
+            self.driver.get(url)
+
+            select = wait_for_week_selector(self.driver, timeout=20)
+            week_values = [opt.get_attribute("value") for opt in select.options]
+            real_weeks = week_values[1:]  # skip placeholder option at index 0
+
+            weeks_to_scrape = real_weeks[:n_weeks]
+            logger.info(f"Scraping {len(weeks_to_scrape)} recent weeks: {weeks_to_scrape}")
+
+            for week_value in weeks_to_scrape:
+                try:
+                    select = wait_for_week_selector(self.driver, timeout=10)
+                    select.select_by_value(week_value)
+                    _time.sleep(1)
+
+                    try:
+                        _WDW(self.driver, 10).until(
+                            _EC.presence_of_element_located(
+                                (_By.XPATH, "//td[@data-test-id='programResult-result']")
+                            )
+                        )
+                    except Exception:
+                        logger.warning(f"No results found for week {week_value}, skipping")
+                        continue
+
+                    week_label = select.first_selected_option.text.strip()
+                    logger.info(f"Scraping week {week_value}: {week_label}")
+
+                    wait_for_min_matches(self.driver, expected_matches=14, max_wait_time=10)
+                    _time.sleep(1.5)
+                    scroll_to_load_matches(self.driver)
+
+                    name_els, result_els, status_els = fetch_match_elements_with_retries(
+                        self.driver, attempts=2, sleep_between=1.5
+                    )
+
+                    week_count = 0
+                    for name_el, result_el, status_el in zip(name_els, result_els, status_els):
+                        match_name   = (name_el.get_attribute("textContent") or "").strip()
+                        match_result = (result_el.get_attribute("textContent") or "").strip()
+                        status_text  = (status_el.get_attribute("textContent") or "").strip()
+
+                        if match_name and match_result in ("1", "2", "X") and "-" in match_name:
+                            teams = match_name.split("-", 1)
+                            home  = teams[0].strip()
+                            away  = teams[1].strip()
+                            if home and away:
+                                hg, ag = parse_score_from_status_text(status_text)
+                                all_results.append((home, away, match_result, week_label, None, hg, ag))
+                                week_count += 1
+
+                    logger.info(f"Week {week_value} ({week_label}): collected {week_count} matches")
+
+                except Exception as e:
+                    logger.error(f"Error scraping week {week_value}: {e}")
+                    continue
+
+            if all_results:
+                self.db.insert_historical_matches_batch(all_results)
+                logger.info(f"Stored total {len(all_results)} matches from {n_weeks} recent weeks")
+
+            return all_results
+
+        except Exception as e:
+            logger.error(f"Error in scrape_recent_weeks: {e}")
+            return []
+        finally:
+            cleanup_driver(self.driver)
+            self.driver = None
+
     
     def scrape_historical_results(self, 
                                   url: str = "https://www.nesine.com/sportoto/mac-sonuclari",

@@ -80,11 +80,26 @@ class MatchDatabase:
                 probability_1 REAL,
                 probability_x REAL,
                 probability_2 REAL,
+                batch_id TEXT,
                 prediction_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 actual_result TEXT,
                 is_correct INTEGER,
                 UNIQUE(home_team, away_team, prediction_date)
             )
+        """)
+        
+        # Add batch_id column if it doesn't exist (for existing databases)
+        try:
+            cursor.execute("ALTER TABLE predictions ADD COLUMN batch_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        # Unique index on (home_team, away_team, batch_id) – prevents duplicate
+        # rows when the prediction pipeline is run more than once for the same week.
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_batch_match
+            ON predictions (home_team, away_team, batch_id)
+            WHERE batch_id IS NOT NULL
         """)
         
         # Model performance table
@@ -100,6 +115,61 @@ class MatchDatabase:
                 model_path TEXT
             )
         """)
+        
+        # Prediction combinations table - stores all generated combinations per batch
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS prediction_combinations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                combination_rank INTEGER NOT NULL,
+                predictions TEXT NOT NULL,
+                confidence_score REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Combination results table - tracks which combination was correct
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS combination_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                winning_rank INTEGER,
+                total_correct INTEGER,
+                total_matches INTEGER,
+                evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(batch_id)
+            )
+        """)
+        
+        # Monte Carlo results table - stores simulation results
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS monte_carlo_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                attempts_to_perfect INTEGER NOT NULL,
+                theoretical_probability REAL NOT NULL,
+                expected_attempts INTEGER NOT NULL,
+                simulation_time REAL,
+                is_success INTEGER DEFAULT 0,
+                best_correct INTEGER,
+                best_attempt INTEGER,
+                total_matches INTEGER,
+                evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(batch_id)
+            )
+        """)
+        
+        # Add newer columns for existing databases
+        for col, definition in [
+            ("is_success",  "INTEGER DEFAULT 0"),
+            ("best_correct", "INTEGER"),
+            ("best_attempt", "INTEGER"),
+            ("total_matches", "INTEGER"),
+        ]:
+            try:
+                cursor.execute(f"ALTER TABLE monte_carlo_results ADD COLUMN {col} {definition}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         
         conn.commit()
         conn.close()
@@ -304,20 +374,43 @@ class MatchDatabase:
         logger.info("Upcoming matches cleared")
     
     def insert_prediction(self, home_team: str, away_team: str,
-                         predicted_result: str, probability_1: float,
-                         probability_x: float, probability_2: float):
-        """Insert a prediction."""
+                          predicted_result: str, probability_1: float,
+                          probability_x: float, probability_2: float,
+                          batch_id: Optional[str] = None):
+        """Insert a prediction with optional batch_id.
+        
+        When batch_id is given, uses upsert semantics keyed on
+        (home_team, away_team, batch_id) so re-running the pipeline
+        for the same week overwrites rather than duplicates the row.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         try:
-            cursor.execute("""
-                INSERT OR REPLACE INTO predictions
-                (home_team, away_team, predicted_result, probability_1,
-                 probability_x, probability_2, prediction_date)
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (home_team, away_team, predicted_result, probability_1,
-                  probability_x, probability_2))
+            if batch_id is not None:
+                cursor.execute("""
+                    INSERT INTO predictions
+                    (home_team, away_team, predicted_result, probability_1,
+                     probability_x, probability_2, batch_id, prediction_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(home_team, away_team, batch_id)
+                    DO UPDATE SET
+                        predicted_result = excluded.predicted_result,
+                        probability_1    = excluded.probability_1,
+                        probability_x    = excluded.probability_x,
+                        probability_2    = excluded.probability_2,
+                        prediction_date  = excluded.prediction_date
+                """, (home_team, away_team, predicted_result, probability_1,
+                      probability_x, probability_2, batch_id))
+            else:
+                # No batch_id: fall back to timestamp-keyed insert
+                cursor.execute("""
+                    INSERT OR REPLACE INTO predictions
+                    (home_team, away_team, predicted_result, probability_1,
+                     probability_x, probability_2, batch_id, prediction_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (home_team, away_team, predicted_result, probability_1,
+                      probability_x, probability_2, batch_id))
             conn.commit()
             conn.close()
             return True
@@ -345,6 +438,20 @@ class MatchDatabase:
         
         conn.commit()
         conn.close()
+    
+    def get_predictions_by_batch(self, batch_id: str) -> pd.DataFrame:
+        """Get predictions for a specific batch."""
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query("""
+            SELECT home_team, away_team, predicted_result,
+                   probability_1, probability_x, probability_2,
+                   actual_result, is_correct, prediction_date, batch_id
+            FROM predictions
+            WHERE batch_id = ?
+            ORDER BY id
+        """, conn, params=(batch_id,))
+        conn.close()
+        return df
     
     def get_predictions(self, limit: int = 100) -> pd.DataFrame:
         """Get recent predictions with accuracy."""
@@ -400,4 +507,167 @@ class MatchDatabase:
         
         conn.commit()
         conn.close()
+    
+    def save_prediction_combinations(self, batch_id: str, combinations: List[dict]):
+        """
+        Save all prediction combinations for a batch.
+        
+        Args:
+            batch_id: Unique identifier for this prediction batch (e.g., "2026-W05")
+            combinations: List of dicts with 'predictions' (list) and 'score' (float)
+        """
+        import json
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # Clear existing combinations for this batch
+            cursor.execute("DELETE FROM prediction_combinations WHERE batch_id = ?", (batch_id,))
+            
+            # Insert all combinations
+            for rank, combo in enumerate(combinations, 1):
+                predictions_json = json.dumps(combo['predictions'])
+                cursor.execute("""
+                    INSERT INTO prediction_combinations
+                    (batch_id, combination_rank, predictions, confidence_score)
+                    VALUES (?, ?, ?, ?)
+                """, (batch_id, rank, predictions_json, combo['score']))
+            
+            conn.commit()
+            logger.info(f"Saved {len(combinations)} combinations for batch {batch_id}")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Error saving combinations: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def get_combinations_for_batch(self, batch_id: str) -> List[dict]:
+        """Get all combinations for a specific batch."""
+        import json
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT combination_rank, predictions, confidence_score
+            FROM prediction_combinations
+            WHERE batch_id = ?
+            ORDER BY combination_rank
+        """, (batch_id,))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                'rank': row[0],
+                'predictions': json.loads(row[1]),
+                'score': row[2]
+            })
+        
+        conn.close()
+        return results
+    
+    def save_combination_result(self, batch_id: str, winning_rank: Optional[int], 
+                                total_correct: int, total_matches: int):
+        """
+        Save the evaluation result for a batch.
+        
+        Args:
+            batch_id: Batch identifier
+            winning_rank: Which combination was correct (None if none matched perfectly)
+            total_correct: Number of correct matches in winning combination
+            total_matches: Total number of matches
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO combination_results
+                (batch_id, winning_rank, total_correct, total_matches)
+                VALUES (?, ?, ?, ?)
+            """, (batch_id, winning_rank, total_correct, total_matches))
+            
+            conn.commit()
+            logger.info(f"Saved result for batch {batch_id}: rank {winning_rank}, {total_correct}/{total_matches}")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Error saving combination result: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def get_combination_statistics(self) -> pd.DataFrame:
+        """Get statistics on which combination ranks win most often."""
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query("""
+            SELECT batch_id, winning_rank, total_correct, total_matches,
+                   CAST(total_correct AS REAL) / total_matches * 100 as accuracy,
+                   evaluated_at
+            FROM combination_results
+            ORDER BY evaluated_at DESC
+        """, conn)
+        conn.close()
+        return df
+    
+    def get_latest_batch_id(self) -> Optional[str]:
+        """Get the most recent batch_id."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT batch_id FROM prediction_combinations
+            ORDER BY created_at DESC LIMIT 1
+        """)
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result[0] if result else None
+    
+    def save_monte_carlo_result(self, batch_id: str, attempts: int,
+                                theoretical_prob: float, expected_attempts: int,
+                                simulation_time: float, is_success: bool = False,
+                                best_correct: Optional[int] = None,
+                                best_attempt: Optional[int] = None,
+                                total_matches: Optional[int] = None):
+        """Save Monte Carlo simulation result (always saved, success or not)."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO monte_carlo_results
+                (batch_id, attempts_to_perfect, theoretical_probability,
+                 expected_attempts, simulation_time,
+                 is_success, best_correct, best_attempt, total_matches)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (batch_id, attempts, theoretical_prob, expected_attempts,
+                  simulation_time, 1 if is_success else 0,
+                  best_correct, best_attempt, total_matches))
+            
+            conn.commit()
+            logger.info(f"Saved Monte Carlo result for {batch_id}: {attempts} attempts (success={is_success})")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Error saving Monte Carlo result: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def get_monte_carlo_statistics(self) -> pd.DataFrame:
+        """Get all Monte Carlo simulation results."""
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query("""
+            SELECT batch_id, attempts_to_perfect, theoretical_probability,
+                   expected_attempts, simulation_time,
+                   is_success, best_correct, best_attempt, total_matches,
+                   evaluated_at
+            FROM monte_carlo_results
+            ORDER BY evaluated_at DESC
+        """, conn)
+        conn.close()
+        return df
 

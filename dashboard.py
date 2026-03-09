@@ -14,7 +14,12 @@ import plotly.graph_objects as go
 from datetime import datetime
 import sqlite3
 import os
+import logging
 from pathlib import Path
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Page configuration
 st.set_page_config(
@@ -202,11 +207,13 @@ def main():
     # Sidebar
     page = st.sidebar.radio(
         "Select Page",
-        ["This Week's Predictions", "Historical Accuracy", "Deep Analysis", "Model Statistics", "Data Overview"]
+        ["This Week's Predictions", "Combination Performance", "Historical Accuracy", "Deep Analysis", "Model Statistics", "Data Overview"]
     )
     
     if page == "This Week's Predictions":
         show_predictions()
+    elif page == "Combination Performance":
+        show_combination_performance()
     elif page == "Historical Accuracy":
         show_accuracy()
     elif page == "Model Statistics":
@@ -395,6 +402,241 @@ def show_deep_analysis():
             st.warning("Please select distinct teams.")
 
 
+def calculate_entropy(p1, px, p2):
+    """
+    Calculate Shannon entropy for a match prediction.
+    
+    Higher entropy = more uncertain match
+    Range: [0, ~1.58] (max with 3 equally likely outcomes)
+    
+    Args:
+        p1: Probability of home win
+        px: Probability of draw  
+        p2: Probability of away win
+    
+    Returns:
+        Entropy value (float)
+    """
+    probs = [p for p in [p1, px, p2] if p > 0]  # Remove zeros
+    
+    if not probs:
+        return 0.0
+    
+    # Shannon entropy: H(X) = -Σ p(x) * log2(p(x))
+    entropy = -sum(p * np.log2(p) for p in probs)
+    return entropy
+
+
+def generate_prediction_combinations(predictions_df, n_combinations=7, top_k=5):
+    """
+    Generate smart prediction combinations based on entropy (uncertainty).
+    
+    Strategy:
+    1. Calculate entropy for each match
+    2. Identify top-K most uncertain matches
+    3. Fix certain matches to their best prediction
+    4. Generate combinations only varying uncertain matches
+    
+    This dramatically reduces Monte Carlo attempts needed!
+    
+    Args:
+        predictions_df: DataFrame with predictions and probabilities
+        n_combinations: Number of combinations to generate (default: 7)
+        top_k: Number of most uncertain matches to vary (default: 5)
+    
+    Returns:
+        List of dicts with 'predictions' (list), 'score' (float), and metadata
+    """
+    if predictions_df.empty:
+        return []
+    
+    # Extract match info with entropy
+    matches = []
+    entropies = []
+    
+    for _, row in predictions_df.iterrows():
+        p1 = row['probability_1']
+        px = row['probability_x']
+        p2 = row['probability_2']
+        
+        # Calculate entropy for this match
+        entropy = calculate_entropy(p1, px, p2)
+        entropies.append(entropy)
+        
+        probs = {'1': p1, 'X': px, '2': p2}
+        sorted_outcomes = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+        
+        matches.append({
+            'home': row['home_team'],
+            'away': row['away_team'],
+            'probs': probs,
+            'sorted': sorted_outcomes,
+            'entropy': entropy,
+            'best': sorted_outcomes[0][0]
+        })
+    
+    # Find top-K most uncertain matches (highest entropy)
+    uncertain_indices = sorted(
+        range(len(matches)),
+        key=lambda i: matches[i]['entropy'],
+        reverse=True
+    )[:min(top_k, len(matches))]
+    
+    logger.info(f"Smart combination generation: {len(matches)} matches, {len(uncertain_indices)} uncertain")
+    logger.info(f"Uncertain match indices: {uncertain_indices}")
+    
+    # Build base prediction (certain matches use best prediction)
+    base_predictions = []
+    for idx, match in enumerate(matches):
+        if idx in uncertain_indices:
+            base_predictions.append(None)  # Will vary
+        else:
+            base_predictions.append(match['best'])  # Fixed to best
+    
+    combinations = []
+    
+    # Combination 1: Pure greedy (all best predictions)
+    greedy_pred = [m['best'] for m in matches]
+    greedy_score = np.prod([m['probs'][m['best']] for m in matches])
+    combinations.append({
+        'predictions': greedy_pred,
+        'score': greedy_score,
+        'strategy': 'greedy'
+    })
+    
+    # Generate combinations by varying only uncertain matches
+    from itertools import product
+    
+    # Get all possible outcomes for uncertain matches
+    uncertain_options = []
+    for idx in uncertain_indices:
+        # For each uncertain match, try top 2 or 3 best options
+        match = matches[idx]
+        # Use outcomes with probability > 15% (avoid very unlikely ones)
+        viable = [opt[0] for opt in match['sorted'] if opt[1] > 0.15]
+        if len(viable) < 2:
+            viable = [opt[0] for opt in match['sorted'][:2]]  # At least top 2
+        uncertain_options.append(viable)
+    
+    # Generate all permutations for uncertain matches
+    seen = {tuple(greedy_pred)}
+    
+    for perm in product(*uncertain_options):
+        if len(combinations) >= n_combinations:
+            break
+        
+        # Build full prediction
+        full_prediction = base_predictions.copy()
+        for i, idx in enumerate(uncertain_indices):
+            full_prediction[idx] = perm[i]
+        
+        # Check uniqueness
+        pred_tuple = tuple(full_prediction)
+        if pred_tuple in seen:
+            continue
+        seen.add(pred_tuple)
+        
+        # Calculate score
+        score = np.prod([matches[i]['probs'][p] for i, p in enumerate(full_prediction)])
+        
+        combinations.append({
+            'predictions': full_prediction,
+            'score': score,
+            'strategy': 'smart_topk'
+        })
+    
+    # If we don't have enough combinations, add a few random ones
+    attempt = 0
+    while len(combinations) < n_combinations and attempt < 100:
+        attempt += 1
+        
+        variant = base_predictions.copy()
+        for idx in uncertain_indices:
+            # Random choice from viable options
+            options = [opt[0] for opt in matches[idx]['sorted'][:2]]
+            variant[idx] = np.random.choice(options)
+        
+        pred_tuple = tuple(variant)
+        if pred_tuple not in seen:
+            seen.add(pred_tuple)
+            score = np.prod([matches[i]['probs'][p] for i, p in enumerate(variant)])
+            combinations.append({
+                'predictions': variant,
+                'score': score,
+                'strategy': 'random_fill'
+            })
+    
+    # Sort by score (highest confidence first)
+    combinations.sort(key=lambda x: x['score'], reverse=True)
+    
+    logger.info(f"Generated {len(combinations)} combinations (target: {n_combinations})")
+    
+    return combinations[:n_combinations]
+
+
+def show_prediction_combinations(predictions_df):
+    """Display alternative prediction combinations."""
+    st.subheader("🎯 Alternative Prediction Combinations")
+    st.info("Sistemimiz, olasılıklara göre 5-7 farklı tahmin kombinasyonu oluşturur. "
+            "En yüksek güven skoruna sahip kombinasyon en üstte görünür.")
+    
+    # Generate combinations
+    combinations = generate_prediction_combinations(predictions_df, n_combinations=7)
+    
+    if not combinations:
+        st.warning("Kombinasyon oluşturulamadı.")
+        return
+    
+    # Create display table
+    combo_data = []
+    for i, combo in enumerate(combinations, 1):
+        pred_str = " ".join(combo['predictions'])
+        score_pct = combo['score'] * 100
+        
+        combo_data.append({
+            '#': i,
+            'Kombinasyon': pred_str,
+            'Güven Skoru': f"{score_pct:.2f}%",
+            'Score_Raw': combo['score']  # For highlighting
+        })
+    
+    combo_df = pd.DataFrame(combo_data)
+    
+    # Highlight top 3
+    def highlight_top(row):
+        if row['#'] == 1:
+            return ['background-color: #90EE90'] * len(row)  # Light green
+        elif row['#'] == 2:
+            return ['background-color: #FFD700'] * len(row)  # Gold
+        elif row['#'] == 3:
+            return ['background-color: #FFA500'] * len(row)  # Orange
+        return [''] * len(row)
+    
+    # Display styled table
+    display_df = combo_df[['#', 'Kombinasyon', 'Güven Skoru']]
+    st.dataframe(
+        display_df.style.apply(highlight_top, axis=1),
+        hide_index=True,
+        use_container_width=True
+    )
+    
+    # Expandable section for detailed view
+    with st.expander("📊 Detaylı Kombinasyon Karşılaştırması"):
+        # Match-by-match comparison
+        match_names = [f"{row['home_team']} vs {row['away_team']}" 
+                      for _, row in predictions_df.iterrows()]
+        
+        comparison_data = []
+        for i, combo in enumerate(combinations[:5], 1):  # Top 5
+            row_data = {'Kombinasyon': f"#{i}"}
+            for j, pred in enumerate(combo['predictions']):
+                row_data[f"Maç {j+1}"] = pred
+            row_data['Skor'] = f"{combo['score']*100:.2f}%"
+            comparison_data.append(row_data)
+        
+        st.table(pd.DataFrame(comparison_data))
+
+
 def show_predictions():
     """Display this week's predictions."""
     st.header("📊 This Week's Predictions")
@@ -475,6 +717,10 @@ def show_predictions():
                 color_continuous_scale="RdYlGn"
             )
             st.plotly_chart(fig, width='stretch')
+            
+            # Add alternative combinations section
+            st.markdown("---")
+            show_prediction_combinations(predictions)
         else:
             st.warning("No predictions found for upcoming matches.")
     else:
@@ -638,6 +884,380 @@ def show_model_stats():
                 st.info("No model performance data available. Model metrics are logged during training.")
     except Exception as e:
         st.warning(f"Could not load model statistics: {e}")
+
+
+def show_combination_performance():
+    """Display combination tracking and performance page."""
+    st.header("🎯 Combination Performance Tracker")
+    
+    # Import database
+    from src.database import MatchDatabase
+    from src.combination_evaluator import evaluate_combinations, format_result_summary
+    
+    db = MatchDatabase()
+    
+    # Create tabs
+    tab1, tab2, tab3 = st.tabs(["📊 Current Week", "📈 Historical Performance", "✍️ Enter Results"])
+    
+    # --- Tab 1: Current Week Combinations ---
+    with tab1:
+        st.subheader("This Week's Combinations")
+        
+        latest_batch = db.get_latest_batch_id()
+        
+        if not latest_batch:
+            st.info("No combinations generated yet. Run predictions first: `python main.py --mode predict`")
+        else:
+            st.info(f"**Batch ID:** {latest_batch}")
+            
+            combinations = db.get_combinations_for_batch(latest_batch)
+            
+            if combinations:
+                # Display all combinations in a table
+                combo_data = []
+                for combo in combinations:
+                    pred_str = " ".join(combo['predictions'])
+                    score_pct = combo['score'] * 100
+                    
+                    combo_data.append({
+                        'Rank': combo['rank'],
+                        'Combination': pred_str,
+                        'Confidence Score': f"{score_pct:.4f}%"
+                    })
+                
+                combo_df = pd.DataFrame(combo_data)
+                
+                # Highlight top 3
+                def highlight_top(row):
+                    if row['Rank'] == 1:
+                        return ['background-color: #90EE90'] * len(row)
+                    elif row['Rank'] == 2:
+                        return ['background-color: #FFD700'] * len(row)
+                    elif row['Rank'] == 3:
+                        return ['background-color: #FFA500'] * len(row)
+                    return [''] * len(row)
+                
+                st.dataframe(
+                    combo_df.style.apply(highlight_top, axis=1),
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                # Show if already evaluated
+                stats_df = db.get_combination_statistics()
+                if not stats_df.empty and latest_batch in stats_df['batch_id'].values:
+                    result_row = stats_df[stats_df['batch_id'] == latest_batch].iloc[0]
+                    
+                    if pd.notna(result_row['winning_rank']):
+                        st.success(f"✅ **Sonuç:** {int(result_row['winning_rank'])}. kombinasyon! "
+                                 f"({int(result_row['total_correct'])}/{int(result_row['total_matches'])} doğru)")
+                    else:
+                        st.warning(f"⚠️ Hiçbir kombinasyon tam isabet değil. "
+                                 f"En iyi: {int(result_row['total_correct'])}/{int(result_row['total_matches'])} doğru")
+            else:
+                st.warning("No combinations found for this batch.")
+    
+    # --- Tab 2: Historical Performance ---
+    with tab2:
+        st.subheader("Historical Performance Statistics")
+        
+        stats_df = db.get_combination_statistics()
+        
+        if stats_df.empty:
+            st.info("No historical data yet. Enter results in the 'Enter Results' tab.")
+        else:
+            # Overall statistics
+            total_batches = len(stats_df)
+            perfect_matches = stats_df['winning_rank'].notna().sum()
+            perfect_rate = (perfect_matches / total_batches * 100) if total_batches > 0 else 0
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Weeks Evaluated", total_batches)
+            with col2:
+                st.metric("Perfect Matches", f"{perfect_matches}")
+            with col3:
+                st.metric("Perfect Match Rate", f"{perfect_rate:.1f}%")
+            
+            # Distribution of winning ranks
+            st.subheader("📊 Which Combination Wins Most Often?")
+            
+            winning_ranks = stats_df[stats_df['winning_rank'].notna()]['winning_rank'].astype(int)
+            
+            if len(winning_ranks) > 0:
+                rank_counts = winning_ranks.value_counts().sort_index()
+                
+                fig = px.bar(
+                    x=rank_counts.index,
+                    y=rank_counts.values,
+                    labels={'x': 'Combination Rank', 'y': 'Number of Wins'},
+                    title="Distribution of Winning Combinations"
+                )
+                fig.update_xaxis(tickmode='linear')
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Pie chart
+                fig_pie = px.pie(
+                    values=rank_counts.values,
+                    names=[f"#{rank}" for rank in rank_counts.index],
+                    title="Winning Combination Distribution"
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+            else:
+                st.info("No perfect matches yet.")
+            
+            # Average accuracy per rank
+            st.subheader("📈 Average Accuracy by Rank")
+            avg_accuracy = stats_df.groupby('winning_rank')['accuracy'].mean().sort_index()
+            
+            if not avg_accuracy.empty:
+                fig = px.line(
+                    x=avg_accuracy.index,
+                    y=avg_accuracy.values,
+                    markers=True,
+                    labels={'x': 'Winning Rank', 'y': 'Average Accuracy (%)'},
+                    title="Average Accuracy for Each Winning Rank"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Timeline
+            st.subheader("📅 Performance Over Time")
+            stats_df['evaluated_at'] = pd.to_datetime(stats_df['evaluated_at'])
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=stats_df['evaluated_at'],
+                y=stats_df['winning_rank'],
+                mode='lines+markers',
+                name='Winning Rank',
+                marker=dict(size=10)
+            ))
+            fig.update_layout(
+                title="Winning Combination Rank Over Time",
+                xaxis_title="Date",
+                yaxis_title="Winning Rank",
+                yaxis=dict(autorange="reversed")
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Detailed table
+            st.subheader("📋 Detailed History")
+            display_df = stats_df[['batch_id', 'winning_rank', 'total_correct', 'total_matches', 'accuracy', 'evaluated_at']]
+            display_df.columns = ['Batch', 'Winning Rank', 'Correct', 'Total', 'Accuracy (%)', 'Evaluated']
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
+    
+    # --- Tab 3: Enter Results ---
+    with tab3:
+        st.subheader("✍️ Enter Actual Results")
+        
+        # Get all available batches (from prediction_combinations table)
+        try:
+            all_batches_df = pd.read_sql_query(
+                "SELECT DISTINCT batch_id FROM prediction_combinations ORDER BY batch_id DESC",
+                db.get_db_connection() if hasattr(db, 'get_db_connection') else sqlite3.connect(db.db_path)
+            )
+            
+            if all_batches_df.empty:
+                st.warning("No batches available. Generate predictions first: `python main.py --mode predict`")
+                return
+            
+            available_batches = all_batches_df['batch_id'].tolist()
+            
+            # Batch selector
+            st.write("**Select Batch to Evaluate:**")
+            selected_batch = st.selectbox(
+                "Batch",
+                options=available_batches,
+                format_func=lambda x: f"{x} {'(Latest)' if x == available_batches[0] else ''}",
+                label_visibility="collapsed"
+            )
+            
+            # Session-state key scoped to the selected batch
+            reeval_key = f"re_evaluate_{selected_batch}"
+            if reeval_key not in st.session_state:
+                st.session_state[reeval_key] = False
+            
+            # Check if already evaluated
+            stats_df = db.get_combination_statistics()
+            already_evaluated = (
+                not stats_df.empty
+                and selected_batch in stats_df['batch_id'].values
+                and not st.session_state[reeval_key]
+            )
+            
+            if already_evaluated:
+                result_row = stats_df[stats_df['batch_id'] == selected_batch].iloc[0]
+                st.info(f"ℹ️ Bu batch zaten değerlendirilmiş: "
+                       f"{'Kazanan: #' + str(int(result_row['winning_rank'])) if pd.notna(result_row['winning_rank']) else 'Tam isabet yok'} "
+                       f"({int(result_row['total_correct'])}/{int(result_row['total_matches'])} doğru)")
+                
+                # Show Monte Carlo results if available
+                monte_carlo_df = db.get_monte_carlo_statistics()
+                if not monte_carlo_df.empty and selected_batch in monte_carlo_df['batch_id'].values:
+                    st.write("---")
+                    st.subheader("🎲 Monte Carlo Simülasyonu Sonuçları")
+                    
+                    mc_row = monte_carlo_df[monte_carlo_df['batch_id'] == selected_batch].iloc[0]
+                    
+                    attempts   = int(mc_row['attempts_to_perfect'])
+                    expected   = int(mc_row['expected_attempts'])
+                    prob       = mc_row['theoretical_probability'] * 100
+                    is_success = bool(mc_row.get('is_success', 0))
+                    best_correct  = mc_row.get('best_correct')
+                    best_attempt  = mc_row.get('best_attempt')
+                    total_matches = mc_row.get('total_matches')
+                    
+                    if is_success:
+                        st.success(f"✅ Tam isabet bulundu! {attempts:,}. denemede.")
+                        if attempts < expected:
+                            diff_pct = ((expected - attempts) / expected) * 100
+                            st.info(f"✨ Şanslı! ({diff_pct:.0f}% daha az deneme)")
+                        elif attempts > expected:
+                            diff_pct = ((attempts - expected) / expected) * 100
+                            st.info(f"😅 Şanssız ({diff_pct:.0f}% daha fazla deneme)")
+                        else:
+                            st.info("🎯 Tam beklenen kadar!")
+                    else:
+                        if pd.notna(best_correct) and pd.notna(total_matches):
+                            st.warning(
+                                f"⚠️ {attempts:,} denemede tam isabet bulunamadı. "
+                                f"En iyi skor: **{int(best_correct)}/{int(total_matches)}** "
+                                f"({int(best_attempt):,}. denemede)"
+                            )
+                        else:
+                            st.warning(f"⚠️ {attempts:,} denemede tam isabet bulunamadı.")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Teorik Olasılık", f"{prob:.3f}%")
+                    with col2:
+                        st.metric("Beklenen Deneme", f"{expected:,}")
+                    with col3:
+                        label = "Tam İsabet Denemesi" if is_success else "Toplam Deneme"
+                        st.metric(label, f"{attempts:,}")
+                
+                st.write("")
+                if st.button("🔄 Yeniden Değerlendir"):
+                    st.session_state[reeval_key] = True
+                    st.rerun()
+                return
+            
+            # Get combinations and predictions for selected batch
+            combinations = db.get_combinations_for_batch(selected_batch)
+            predictions = db.get_predictions_by_batch(selected_batch)
+            
+            if combinations and not predictions.empty:
+                # Show matches
+                st.write(f"**Maçlar ({len(predictions)} adet):**")
+                
+                # Create a form for entering results
+                with st.form("result_entry_form"):
+                    actual_results = []
+                    
+                    for idx, (_, row) in enumerate(predictions.iterrows()):
+                        match_str = f"{row['home_team']} vs {row['away_team']}"
+                        
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.write(f"**{idx+1}.** {match_str}")
+                        with col2:
+                            result = st.selectbox(
+                                "Result",
+                                options=['1', 'X', '2'],
+                                key=f"result_{idx}",
+                                label_visibility="collapsed"
+                            )
+                            actual_results.append(result)
+                    
+                    submitted = st.form_submit_button("🎯 Evaluate Combinations")
+                    
+                    if submitted:
+                        # Evaluate combinations
+                        evaluation = evaluate_combinations(combinations, actual_results)
+                        
+                        # Save to database
+                        db.save_combination_result(
+                            batch_id=selected_batch,
+                            winning_rank=evaluation['winning_rank'],
+                            total_correct=evaluation['best_correct'],
+                            total_matches=evaluation['total_matches']
+                        )
+                        
+                        # Show results
+                        summary = format_result_summary(evaluation)
+                        
+                        if evaluation['perfect_match']:
+                            st.success(summary)
+                            st.balloons()
+                        else:
+                            st.info(summary)
+                        
+                        # Detailed breakdown
+                        with st.expander("📊 Detailed Breakdown"):
+                            breakdown_df = pd.DataFrame(evaluation['results_per_combination'])
+                            breakdown_df.columns = ['Rank', 'Correct Matches', 'Accuracy (%)']
+                            st.dataframe(breakdown_df, hide_index=True, use_container_width=True)
+                        
+                        # Monte Carlo simulation
+                        st.write("---")
+                        st.subheader("🎲 Monte Carlo Simülasyonu")
+                        
+                        with st.spinner("Simülasyon çalıştırılıyor..."):
+                            from src.combination_evaluator import simulate_perfect_match, format_monte_carlo_summary
+                            
+                            # Run simulation
+                            monte_carlo_result = simulate_perfect_match(
+                                predictions, 
+                                actual_results,
+                                max_attempts=500000
+                            )
+                            
+                            # Always save Monte Carlo result (success or failure)
+                            db.save_monte_carlo_result(
+                                batch_id=selected_batch,
+                                attempts=monte_carlo_result['attempts'],
+                                theoretical_prob=monte_carlo_result['theoretical_probability'],
+                                expected_attempts=monte_carlo_result['expected_attempts'],
+                                simulation_time=monte_carlo_result['simulation_time'],
+                                is_success=monte_carlo_result['success'],
+                                best_correct=monte_carlo_result.get('best_correct'),
+                                best_attempt=monte_carlo_result.get('best_attempt'),
+                                total_matches=len(actual_results)
+                            )
+                            
+                            # Display result
+                            monte_summary = format_monte_carlo_summary(monte_carlo_result)
+                            st.info(monte_summary)
+                            
+                            if not monte_carlo_result['success']:
+                                best_c = monte_carlo_result.get('best_correct', 0)
+                                best_a = monte_carlo_result.get('best_attempt', 0)
+                                total  = len(actual_results)
+                                st.warning(
+                                    f"🎯 En iyi skor: **{best_c}/{total}** doğru — "
+                                    f"{best_a:,}. denemede ulaşıldı"
+                                )
+                            
+                            # Additional details
+                            with st.expander("🔍 Detaylar"):
+                                st.write(f"**Simülasyon süresi:** {monte_carlo_result['simulation_time']:.2f} saniye")
+                                st.write(f"**Maksimum deneme limiti:** 500,000")
+                                
+                                if monte_carlo_result['success']:
+                                    st.write(f"**Başarı durumu:** ✅ Tam isabet bulundu!")
+                                else:
+                                    st.write(f"**Başarı durumu:** ⚠️ Limit aşıldı (olasılık çok düşük)")
+                        
+                        # Reset re-evaluate flag
+                        if reeval_key in st.session_state:
+                            st.session_state[reeval_key] = False
+                        st.success("✅ Results saved! Check the 'Historical Performance' tab.")
+            else:
+                st.warning(f"No predictions or combinations found for batch: {selected_batch}")
+                
+        except Exception as e:
+            st.error(f"Error loading batches: {e}")
+            st.info("Make sure you have generated predictions first: `python main.py --mode predict`")
 
 
 def show_data_overview():

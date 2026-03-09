@@ -194,36 +194,76 @@ def scrape_upcoming(driver: webdriver.Chrome, url: str) -> List[Tuple[str, str]]
     Driver lifecycle is managed by the caller.
     """
     logger.info(f"Scraping upcoming matches from {url}")
-    driver.get(url)
+    
+    try:
+        driver.get(url)
+        logger.info("Page loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load page {url}: {e}")
+        raise
 
-    WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located(
-            (By.XPATH, "//td[@data-test-id='name']/button[@data-testid='nsn-button']")
+    try:
+        # Wait for match buttons to appear - NEW: using button.nsn-btn instead of links
+        # Increased timeout to 30 seconds for slower connections
+        logger.info("Waiting for match button elements to appear...")
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "button[data-testid='nsn-button']")
+            )
         )
-    )
+        logger.info("Match button elements found")
+    except Exception as e:
+        logger.error(f"Timeout waiting for match button elements: {e}")
+        logger.error(f"Current URL: {driver.current_url}")
+        logger.error(f"Page title: {driver.title}")
+        # Save page source for debugging
+        try:
+            with open("debug_page_source.html", "w", encoding="utf-8") as f:
+                f.write(driver.page_source)
+            logger.error("Page source saved to debug_page_source.html for inspection")
+        except:
+            pass
+        raise
 
     time.sleep(2)  # Allow page to fully load
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    match_elements = soup.find_all("button", attrs={"data-testid": "nsn-button"})
+    
+    try:
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+    except Exception as e:
+        logger.error(f"Failed to parse page source with BeautifulSoup: {e}")
+        raise
+    
+    # NEW: Match names are now in button elements with class nsn-btn
+    match_elements = soup.find_all("button", {"data-testid": "nsn-button"})
 
     if not match_elements:
-        logger.warning("No match elements found. Website structure may have changed.")
+        logger.warning("No match button elements found. Website structure may have changed.")
+        logger.warning(f"Total buttons found on page: {len(soup.find_all('button'))}")
+        logger.warning(f"Total nsn-btn buttons: {len(soup.find_all('button', class_='nsn-btn'))}")
         return []
 
-    logger.info(f"Found {len(match_elements)} potential match elements")
+    logger.info(f"Found {len(match_elements)} potential match button elements")
 
     matches: List[Tuple[str, str]] = []
     for element in match_elements:
-        full_match_name = element.get_text().strip()
-        match_teams_only = full_match_name.split("\n")[0].strip()
-        match_teams_only = re.sub(r"\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}", "", match_teams_only).strip()
+        # Get text and clean up whitespace/newlines
+        full_match_name = element.get_text(separator=" ", strip=True)
+        
+        # Remove any date/time suffix if present
+        match_teams_only = re.sub(r"\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}", "", full_match_name)
+        
+        # Clean up extra whitespace (including multiple spaces and newlines)
+        match_teams_only = re.sub(r"\s+", " ", match_teams_only).strip()
+        
         if "-" in match_teams_only:
-            teams = match_teams_only.split("-")
+            teams = match_teams_only.split("-", 1)  # Split only on first hyphen
             home_team = teams[0].strip()
-            away_team = teams[1].strip()
+            away_team = teams[1].strip() if len(teams) > 1 else ""
             if home_team and away_team:
                 matches.append((home_team, away_team))
+                logger.debug(f"Parsed match: {home_team} vs {away_team}")
 
+    logger.info(f"Successfully parsed {len(matches)} matches")
     return matches[-15:] if len(matches) >= 15 else matches
 
 

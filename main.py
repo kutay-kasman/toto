@@ -186,7 +186,11 @@ class PredictionPipeline:
                 matches_df, historical_df, self.model.feature_columns
             )
             
-            # Store predictions in database
+            # Generate batch_id first (e.g., "2026-W05")
+            from datetime import datetime
+            batch_id = f"{datetime.now().year}-W{datetime.now().strftime('%W')}"
+            
+            # Store predictions in database with batch_id
             for _, pred in predictions_df.iterrows():
                 self.db.insert_prediction(
                     home_team=pred['Ev Sahibi Takım'],
@@ -194,8 +198,23 @@ class PredictionPipeline:
                     predicted_result=pred['Predicted_Result'],
                     probability_1=pred['Probability_1'] / 100,
                     probability_x=pred['Probability_X'] / 100,
-                    probability_2=pred['Probability_2'] / 100
+                    probability_2=pred['Probability_2'] / 100,
+                    batch_id=batch_id
                 )
+            
+            # Generate and save prediction combinations
+            from dashboard import generate_prediction_combinations
+            
+            # Get predictions with batch_id
+            predictions_for_combos = self.db.get_predictions_by_batch(batch_id)
+            
+            # Generate 7 different combinations
+            combinations = generate_prediction_combinations(predictions_for_combos, n_combinations=7)
+            
+            # Save combinations to database
+            if combinations:
+                self.db.save_prediction_combinations(batch_id, combinations)
+                logger.info(f"Saved {len(combinations)} combinations to database with batch_id: {batch_id}")
             
             # Print results
             self._print_predictions(predictions_df)
@@ -207,29 +226,32 @@ class PredictionPipeline:
             logger.error(f"Error in prediction pipeline: {e}", exc_info=True)
             return False
     
-    def update_prediction_accuracy(self, scrape_latest: bool = True):
+    def update_prediction_accuracy(self, scrape_latest: bool = True, weeks: int = 1):
         """
         Update predictions with actual results from historical matches.
-        Matches predictions with historical matches and updates accuracy.
-        
+
         Args:
-            scrape_latest: If True, scrape only the latest week's results first.
-                          If False, use existing database data only.
+            scrape_latest: If True, scrape recent weeks first.
+            weeks: How many recent weeks to scrape (default 1 = latest only).
         """
+        import difflib
         logger.info("Starting prediction accuracy update")
         
         try:
-            # Optionally scrape latest week's results first
+            # Scrape recent weeks
             if scrape_latest:
-                logger.info("Scraping latest week's results...")
-                latest_matches = self.scraper.scrape_latest_week_results()
+                if weeks > 1:
+                    logger.info(f"Scraping last {weeks} weeks of results...")
+                    latest_matches = self.scraper.scrape_recent_weeks(n_weeks=weeks)
+                else:
+                    logger.info("Scraping latest week's results...")
+                    latest_matches = self.scraper.scrape_latest_week_results()
                 
                 if latest_matches:
-                    # Store latest week's results in database
                     self.db.insert_historical_matches_batch(latest_matches)
-                    logger.info(f"Stored {len(latest_matches)} matches from latest week")
+                    logger.info(f"Stored {len(latest_matches)} matches from {weeks} week(s)")
                 else:
-                    logger.warning("No matches found in latest week")
+                    logger.warning("No matches found")
             
             # Get all predictions without actual results
             predictions = self.db.get_predictions(limit=10000)
@@ -288,6 +310,20 @@ class PredictionPipeline:
                 ]
                 
                 if match.empty:
+                    # Fuzzy fallback: find closest team name pair
+                    all_home = historical_with_results['Ev Sahibi Takım'].tolist()
+                    all_away = historical_with_results['Deplasman Takımı'].tolist()
+                    home_close = difflib.get_close_matches(home_team, all_home, n=1, cutoff=0.75)
+                    away_close = difflib.get_close_matches(away_team, all_away, n=1, cutoff=0.75)
+                    if home_close and away_close:
+                        match = historical_with_results[
+                            (historical_with_results['Ev Sahibi Takım'] == home_close[0]) &
+                            (historical_with_results['Deplasman Takımı'] == away_close[0])
+                        ]
+                        if not match.empty:
+                            logger.info(f"Fuzzy match: '{home_team}' -> '{home_close[0]}', '{away_team}' -> '{away_close[0]}'")
+
+                if match.empty:
                     # Try reverse match (teams might be swapped)
                     match = historical_with_results[
                         (historical_with_results['Ev Sahibi Takım'] == away_team) &
@@ -313,7 +349,7 @@ class PredictionPipeline:
                 # Update prediction with actual result
                 self.db.update_prediction_result(home_team, away_team, actual_result)
                 updated_count += 1
-                logger.info(f"✓ Updated prediction: {home_team} vs {away_team} -> {actual_result}")
+                logger.info(f"[OK] Updated prediction: {home_team} vs {away_team} -> {actual_result}")
             
             logger.info(f"Updated {updated_count} predictions with actual results")
             
@@ -388,6 +424,12 @@ def main():
         help='Run hyperparameter optimization using Optuna'
     )
     parser.add_argument(
+        '--weeks',
+        type=int,
+        default=1,
+        help='Number of recent result weeks to scrape for update-accuracy (default: 1)'
+    )
+    parser.add_argument(
         '--n-trials',
         type=int,
         default=20,
@@ -433,7 +475,7 @@ def main():
     if args.mode == 'update-accuracy':
         # Scrape latest week's results and update accuracy
         # scrape_latest=True means it will scrape only the latest week (efficient)
-        success = pipeline.update_prediction_accuracy(scrape_latest=True)
+        success = pipeline.update_prediction_accuracy(scrape_latest=True, weeks=args.weeks)
         if not success:
             logger.error("Accuracy update failed")
             return 1
